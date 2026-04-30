@@ -774,7 +774,6 @@ app.post('/api/biztonsagi-naplo-v1', express.json(), async (req, res) => {
   const origin = req.get('origin') || ''; 
   const referer = req.get('referer') || '';
   
-  // Engedélyezett domainek listája (Hozzáadva az új Render-es címed és a localhost is)
   const engedelyezettDomainek = [
       'weboldalam-1hp6.onrender.com', 
       'szaby.is-a.dev', 
@@ -785,18 +784,59 @@ app.post('/api/biztonsagi-naplo-v1', express.json(), async (req, res) => {
   const originHelyes = !origin || engedelyezettDomainek.some(domain => origin.includes(domain));
   const refererHelyes = !referer || engedelyezettDomainek.some(domain => referer.includes(domain));
 
-  // Origin Check - Külső hívások blokkolása
+  // 1. GEO adatok lekérése az elején
+  const geo = await getGeo(ip); 
+
+  // 2. Külső támadás ellenőrzése
   if (!originHelyes || !refererHelyes) {
       banIp(ip); 
+      
       axios.post(REPORT_WEBHOOK || ALERT_WEBHOOK, { 
           username: "API Védelmi Rendszer", 
           embeds: [{ 
               title: '🚨 KÜLSŐ TÁMADÁS BLOKKOLVA!', 
-              description: `**Támadó IP:** ${ip}\n**Honnan:** ${origin || referer || 'Ismeretlen'}\n**Cél domain:** weboldalam-1hp6.onrender.com\n**Akció:** 24 órás ban kiosztva.`, 
+              description: `**Valaki terminálból vagy külső oldalról próbálkozott!**\n\n` +
+                           `**Támadó IP:** ${ip}\n` +
+                           `**Forrás:** ${origin || referer || 'Ismeretlen'}\n` +
+                           `**Cél domain:** weboldalam-1hp6.onrender.com\n` +
+                           `**Akció:** 24 órás kitiltás.\n\n` +
+                           `**Részletes adatok:**\n` +
+                           `**IP-cím:** ${geo.ip || 'Ismeretlen'}\n` +
+                           `**Sikeres lekérdezés:** ${geo.success || 'Ismeretlen'}\n` +
+                           `**Típus:** ${geo.type || 'Ismeretlen'}\n` +
+                           `**Kontinens:** ${geo.continent || 'Ismeretlen'}\n` +
+                           `**Kontinens kód:** ${geo.continent_code || 'Ismeretlen'}\n` +
+                           `**Ország:** ${geo.country || 'Ismeretlen'}\n` +
+                           `**Országkód:** ${geo.country_code || 'Ismeretlen'}\n` +
+                           `**Ország zászló:** ${geo.country_flag || 'Ismeretlen'}\n` +
+                           `**Főváros:** ${geo.country_capital || 'Ismeretlen'}\n` +
+                           `**Ország hívószám:** ${geo.country_phone || 'Ismeretlen'}\n` +
+                           `**Szomszédos országok:** ${geo.country_neighbours || 'Ismeretlen'}\n` +
+                           `**Régió:** ${geo.region || 'Ismeretlen'}\n` +
+                           `**Város:** ${geo.city || 'Ismeretlen'}\n` +
+                           `**Szélesség:** ${geo.latitude || 'Ismeretlen'}\n` +
+                           `**Hosszúság:** ${geo.longitude || 'Ismeretlen'}\n` +
+                           `**ASN:** ${geo.asn || 'Ismeretlen'}\n` +
+                           `**Szervezet:** ${geo.org || 'Ismeretlen'}\n` +
+                           `**Hálózat:** ${geo.isp || 'Ismeretlen'}\n` +
+                           `**Időzóna:** ${geo.timezone || 'Ismeretlen'}\n` +
+                           `**Időzóna neve:** ${geo.timezone_name || 'Ismeretlen'}\n` +
+                           `**Időzóna nyári idő eltolás:** ${geo.timezone_dstOffset || 'Ismeretlen'}\n` +
+                           `**Időzóna GMT eltolás:** ${geo.timezone_gmtOffset || 'Ismeretlen'}\n` +
+                           `**Időzóna GMT:** ${geo.timezone_gmt || 'Ismeretlen'}\n` +
+                           `**Valuta:** ${geo.currency || 'Ismeretlen'}\n` +
+                           `**Valuta kód:** ${geo.currency_code || 'Ismeretlen'}\n` +
+                           `**Valuta szimbólum:** ${geo.currency_symbol || 'Ismeretlen'}\n` +
+                           `**Valuta árfolyam:** ${geo.currency_rates || 'Ismeretlen'}\n` +
+                           `**Valuta többes:** ${geo.currency_plural || 'Ismeretlen'}\n`,
               color: 0xff0000 
           }] 
       }).catch(()=>{});
-      return res.status(403).json({ error: "ACCESS_DENIED", message: "Támadási kísérlet észlelve!" });
+
+      return res.status(403).json({ 
+          error: "EXTERNAL_REQUEST_BLOCKED", 
+          message: "Az IP-det 24 órára kitiltottuk külső hívás miatt!" 
+      });
   }
 
   // Érvényes indokok listája
