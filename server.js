@@ -767,22 +767,32 @@ app.post('/admin/permanent-unban/form', express.urlencoded({ extended: true }), 
 /* ====================================================================
    API VÉGPONTOK (REPORT & COUNTER)
    ==================================================================== */
-
 app.post('/api/biztonsagi-naplo-v1', express.json(), async (req, res) => {
   const ip = getClientIp(req);
   const { reason, page } = req.body || {};
   
-  const origin = req.get('origin'); 
-  const referer = req.get('referer');
+  const origin = req.get('origin') || ''; 
+  const referer = req.get('referer') || '';
   
+  // Engedélyezett domainek listája (Hozzáadva az új Render-es címed és a localhost is)
+  const engedelyezettDomainek = [
+      'weboldalam-1hp6.onrender.com', 
+      'szaby.is-a.dev', 
+      'localhost', 
+      '127.0.0.1'
+  ];
+  
+  const originHelyes = !origin || engedelyezettDomainek.some(domain => origin.includes(domain));
+  const refererHelyes = !referer || engedelyezettDomainek.some(domain => referer.includes(domain));
+
   // Origin Check - Külső hívások blokkolása
-  if ((origin && !origin.includes('weboldalam-1hp6.onrender.com')) || (referer && !referer.includes('weboldalam-1hp6.onrender.com'))) {
+  if (!originHelyes || !refererHelyes) {
       banIp(ip); 
       axios.post(REPORT_WEBHOOK || ALERT_WEBHOOK, { 
           username: "API Védelmi Rendszer", 
           embeds: [{ 
               title: '🚨 KÜLSŐ TÁMADÁS BLOKKOLVA!', 
-              description: `**Támadó IP:** ${ip}\n**Honnan:** ${origin || referer || 'Unknown'}\n**Akció:** 24 órás ban kiosztva.`, 
+              description: `**Támadó IP:** ${ip}\n**Honnan:** ${origin || referer || 'Ismeretlen'}\n**Cél domain:** weboldalam-1hp6.onrender.com\n**Akció:** 24 órás ban kiosztva.`, 
               color: 0xff0000 
           }] 
       }).catch(()=>{});
