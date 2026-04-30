@@ -776,7 +776,7 @@ app.post('/api/biztonsagi-naplo-v1', express.json(), async (req, res) => {
   const referer = req.get('referer');
   
   // Origin Check - Külső hívások blokkolása
-  if ((origin && !origin.includes('szaby.is-a.dev')) || (referer && !referer.includes('szaby.is-a.dev'))) {
+  if ((origin && !origin.includes('weboldalam-1hp6.onrender.com')) || (referer && !referer.includes('weboldalam-1hp6.onrender.com'))) {
       banIp(ip); 
       axios.post(REPORT_WEBHOOK || ALERT_WEBHOOK, { 
           username: "API Védelmi Rendszer", 
