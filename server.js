@@ -1,5 +1,34 @@
 require('dotenv').config();
 
+const mongoose = require('mongoose');
+
+// MongoDB Csatlakozás (A MONGODB_URI-t a Vercelen kell megadnod!)
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log("MongoDB connected"))
+  .catch(err => console.error("MongoDB connection error:", err));
+
+// --- MONGODB SÉMÁK (Modellek) ---
+const BanSchema = new mongoose.Schema({
+    ip: { type: String, unique: true },
+    type: { type: String, enum: ['24h', 'permanent'] },
+    expireAt: { type: Date, default: null } // 24 órás bannál használjuk
+});
+// Automatikus törlés a lejárati idő után
+BanSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 });
+const Ban = mongoose.model('Ban', BanSchema);
+
+const AttemptSchema = new mongoose.Schema({
+    ip: { type: String, unique: true },
+    count: { type: Number, default: 0 },
+    lastAttempt: { type: Date, default: Date.now }
+});
+const Attempt = mongoose.model('Attempt', AttemptSchema);
+
+const SettingsSchema = new mongoose.Schema({
+    key: { type: String, unique: true },
+    value: mongoose.Schema.Types.Mixed
+});
+const Settings = mongoose.model('Settings', SettingsSchema);
 const express = require('express');
 const axios = require('axios');
 const path = require('path');
