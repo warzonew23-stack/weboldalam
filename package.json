@@ -1,19 +1,19 @@
 {
   "name": "webhook-ip-logger",
   "version": "1.0.0",
-  "description": "Express szerver Discord webhook IP és ország loggolással",
+  "description": "Express szerver Discord webhook IP és ország loggolással - MongoDB Edition",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@vercel/kv": "^3.0.0",
     "axios": "^1.7.2",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "helmet": "^8.0.0",
+    "mongoose": "^8.0.0",
     "socks-proxy-agent": "^8.0.4"
   }
 }
