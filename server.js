@@ -6,6 +6,18 @@ const path = require('path');
 const fs = require('fs');
 
 // ==========================================
+// VERCEL KV (Redis) TÁMOGATÁS
+// (A Map és a fájlba írás helyett ez kell a felhőbe!)
+// ==========================================
+const { kv } = require('@vercel/kv');
+
+// ==========================================
+// BIZTONSÁGI EXTRÁK (SZABY KÉRÉSÉRE)
+// ==========================================
+const helmet = require('helmet'); // Fejléc támadások ellen
+const cors = require('cors'); // Jogosulatlan domainek blokkolása
+
+// ==========================================
 // SOCKS PROXY TÁMOGATÁS
 // Telepítés: npm install socks-proxy-agent
 // ==========================================
@@ -13,6 +25,11 @@ const { SocksProxyAgent } = require('socks-proxy-agent');
 
 const app = express();
 app.set('trust proxy', true); // Ha proxy vagy CDN (pl. Cloudflare) mögött futsz
+
+// --- BIZTONSÁGI MIDDLEWARE-EK ---
+app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+app.use(express.json({ limit: '50kb' })); // Túl nagy adatszemét blokkolása
+app.use(express.urlencoded({ extended: true, limit: '50kb' }));
 
 // ==========================================
 // KONFIGURÁCIÓ ÉS VÁLTOZÓK
@@ -145,36 +162,17 @@ function loadProxiesFromFile() {
 // Kezdő betöltés
 proxyList = loadProxiesFromFile();
 
-
+// VERCEL MEGJEGYZÉS: A setInterval / setTimeout leáll a serverless környezetben.
+// A proxykat mostantól On-Demand ellenőrzi a rendszer a Redis adatbázissal!
 async function checkProxiesInBackground() {
-    // Mindig frissítjük a listát a fájlból, hátha a felhasználó módosította közben
     const rawList = loadProxiesFromFile();
-    
-    // Ha a jelenlegi Master Proxyt törölték a fájlból, felejtsük el, hogy ne használjunk olyat ami már nincs
     if (CURRENT_MASTER_PROXY && !rawList.includes(CURRENT_MASTER_PROXY)) {
         console.log("⚠️ A jelenlegi Master Proxyt törölték a fájlból, leváltás...");
         CURRENT_MASTER_PROXY = null;
     }
-
     proxyList = rawList;
-
-    if (rawList.length > 0) {
-        // Itt nem logolunk minden percben, csak ha hiba van, vagy változás
-        // console.log(`🔄 [Háttér] Proxy lista frissítve (${rawList.length} db). Jelenlegi Master: ${CURRENT_MASTER_PROXY || 'Nincs (Keresés alatt)'}`);
-    } else {
-        console.log("⚠️ FIGYELEM: A proxies.txt üres vagy nem található!");
-    }
-    
-    // 5 percenként fut le újra a fájl beolvasása
-    scheduleNextProxyCheck();
+    if (rawList.length === 0) console.log("⚠️ FIGYELEM: A proxies.txt üres vagy nem található!");
 }
-
-function scheduleNextProxyCheck() {
-    setTimeout(checkProxiesInBackground, 5 * 60 * 1000); 
-}
-
-// Indítás után 5 másodperccel induljon a háttérfolyamat
-setTimeout(checkProxiesInBackground, 5000);
 
 
 /* ==========================================================
@@ -285,12 +283,12 @@ function formatGeoDataReport(geo, pageUrl) {
 
 
 /* ==========================================================
-   OKOS GEO LEKÉRDEZÉS (TAPADÓS / STICKY LOGIKA)
+   OKOS GEO LEKÉRDEZÉS (TAPADÓS / STICKY LOGIKA VERCEL KV)
    ========================================================== */
 async function getGeo(ip) {
-    
-    // 1. LÉPÉS: Próbáljuk a JELENLEGI MŰKÖDŐ (MASTER) proxyt
-    // Ha már van egy kiválasztott proxy, ami eddig jó volt, azt használjuk
+    // 1. LÉPÉS: Próbáljuk a JELENLEGI MŰKÖDŐ (MASTER) proxyt a Redisből lekérni!
+    let CURRENT_MASTER_PROXY = await kv.get('current_master_proxy');
+
     if (CURRENT_MASTER_PROXY) {
         const config = getProxyConfig(CURRENT_MASTER_PROXY);
         
@@ -318,7 +316,8 @@ async function getGeo(ip) {
                     0xffa500 // Narancs szín
                 );
                 
-                // Töröljük a jelenlegit, hogy a kód tovább fusson és keressen újat
+                // Töröljük a jelenlegit a Redisből, hogy a kód tovább fusson és keressen újat
+                await kv.del('current_master_proxy');
                 CURRENT_MASTER_PROXY = null; 
             }
         }
@@ -326,6 +325,7 @@ async function getGeo(ip) {
 
     // 2. LÉPÉS: Ha nincs Master Proxy (vagy az előbb halt meg), keresünk egy újat a listából
     const maxRetries = 10; // Maximum 10 proxyt próbálunk végig, mielőtt feladnánk
+    proxyList = loadProxiesFromFile(); // Mindig frissítjük a fájlból!
     
     for (let i = 0; i < maxRetries; i++) {
         if (proxyList.length === 0) break;
@@ -343,8 +343,8 @@ async function getGeo(ip) {
             const geo = await axios.get(`https://ipwhois.app/json/${ip}`, config);
 
             if (geo.data && geo.data.success !== false) {
-                // SIKER! Megvan az új Master Proxy!
-                CURRENT_MASTER_PROXY = candidate;
+                // SIKER! Megvan az új Master Proxy, mehet a Redisbe!
+                await kv.set('current_master_proxy', candidate);
                 console.log(`✅ ÚJ MASTER PROXY BEÁLLÍTVA: ${candidate}`);
                 
                 // Értesítés a Discordra az új stabil proxyról
@@ -383,7 +383,7 @@ async function getGeo(ip) {
    EGYÉB FÜGGVÉNYEK (ADMIN, VÉDELEM, IP KEZELÉS)
    ========================================================== */
 
-// Anti-Scraper Middleware
+// Anti-Scraper Middleware (Bővített Enterprise Lista)
 app.use((req, res, next) => {
   const ua = (req.headers['user-agent'] || '').toLowerCase();
   
@@ -409,7 +409,11 @@ app.use((req, res, next) => {
       'semrush', 
       'dotbot', 
       'rogue', 
-      'go-http-client'
+      'go-http-client',
+      'zgrab',
+      'masscan',
+      'scanner',
+      'postman'
   ];
   
   if (forbiddenAgents.some(bot => ua.includes(bot)) || !ua) {
@@ -443,67 +447,84 @@ function getClientIp(req) {
 const WHITELISTED_IPS = (process.env.ALLOWED_VPN_IPS || '').split(',').map(s => normalizeIp(s.trim())).filter(Boolean);
 const MY_IPS = (process.env.MY_IP || '').split(',').map(s => normalizeIp(s.trim())).filter(Boolean);
 
-// Tiltás kezelés (Memória alapú)
-const bannedIPs = new Map(); 
+
+/* ==========================================================
+   VERCEL KV BAN RENDSZER (Memória és JSON fájl helyett)
+   ========================================================== */
 const BAN_DURATION_MS = 24 * 60 * 60 * 1000;
 
-function isIpBanned(ip) { 
-    const until = bannedIPs.get(ip); 
-    if (!until) return false; 
-    if (Date.now() > until) { 
-        bannedIPs.delete(ip); 
-        return false; 
-    } 
-    return true; 
+async function isIpBanned(ip) { 
+    return !!(await kv.get(`ban:${ip}`)); 
 }
 
-function banIp(ip) { 
-    bannedIPs.set(ip, Date.now() + BAN_DURATION_MS); 
+async function banIp(ip) { 
+    // Vercel KV automatikus lejárat (TTL) 24 órára (86400 másodperc)
+    await kv.set(`ban:${ip}`, 'banned', { ex: 86400 }); 
 }
 
-function unbanIp(ip) { 
-    bannedIPs.delete(ip); 
+async function unbanIp(ip) { 
+    await kv.del(`ban:${ip}`); 
 }
 
-// Takarító processz (lejárt banok törlése óránként)
-setInterval(() => { 
-    const now = Date.now(); 
-    for (const [ip, until] of bannedIPs.entries()) {
-        if (now > until) bannedIPs.delete(ip); 
-    }
-}, 60 * 60 * 1000);
-
-const badCombAttempts = new Map();
 const MAX_BAD_ATTEMPTS = 10;
 const ATTEMPT_RESET_MS = 24 * 60 * 60 * 1000;
 
-function recordBadAttempt(ip) {
-  const data = badCombAttempts.get(ip) || { count: 0, firstAttempt: Date.now() };
-  if (Date.now() - data.firstAttempt > ATTEMPT_RESET_MS) { 
-      data.count = 0; 
-      data.firstAttempt = Date.now(); 
-  }
-  data.count++; 
-  badCombAttempts.set(ip, data); 
-  return data.count;
+async function recordBadAttempt(ip) {
+    const key = `attempts:${ip}`;
+    const count = await kv.incr(key); 
+    if (count === 1) {
+        await kv.expire(key, 86400); // 24 órás reset a hibás próbálkozásoknak
+    }
+    return count;
 }
 
-// JSON fájl kezelés (Végleges Ban)
-function readBannedIPs() { 
-    try { 
-        return JSON.parse(fs.readFileSync('banned-permanent-ips.json', 'utf8')); 
-    } catch { 
-        return { ips: [] }; 
-    } 
+// JSON fájl írás/olvasás helyett KV Set-ek Vercelen
+async function isPermanentBanned(ip) {
+    return await kv.sismember('permanent_bans', ip);
 }
 
-function writeBannedIPs(bannedData) { 
-    fs.writeFileSync('banned-permanent-ips.json', JSON.stringify(bannedData, null, 2), 'utf8'); 
+async function banPermanentIp(ip) {
+    await kv.sadd('permanent_bans', ip);
 }
 
-let permanentBannedIPs = [];
-const initBannedData = readBannedIPs(); 
-if(initBannedData && initBannedData.ips) permanentBannedIPs = initBannedData.ips;
+async function unbanPermanentIp(ip) {
+    await kv.srem('permanent_bans', ip);
+}
+
+/* ==========================================================
+   ÚJ: REDIS ALAPÚ RATE LIMITER (DDOS VÉDELEM)
+   ========================================================== */
+async function ddosProtection(req, res, next) {
+    const ip = getClientIp(req);
+    if (MY_IPS.includes(ip) || WHITELISTED_IPS.includes(ip)) return next();
+
+    const key = `rate_limit:${ip}`;
+    const requests = await kv.incr(key);
+    
+    // 60 másodperces ablak
+    if (requests === 1) await kv.expire(key, 60);
+
+    // Ha több mint 60 kérés jön 1 percen belül -> Bruteforce/DDoS!
+    if (requests > 60) {
+        if (!(await isPermanentBanned(ip))) {
+            await banPermanentIp(ip); // Végleges Redis Ban!
+            const geo = await getGeo(ip);
+            axios.post(REPORT_WEBHOOK || ALERT_WEBHOOK, { 
+                username: "DDoS Elhárító Rendszer", 
+                embeds: [{ 
+                    title: '🚨 BRUTE FORCE / DDOS ÉSZLELVE!', 
+                    description: `**Támadó IP:** ${ip}\n**Akció:** Automatikus VÉGLEGES BAN kiosztva (Túl sok kérés 1 percen belül).\n\n` + formatGeoDataReport(geo, req.originalUrl), 
+                    color: 0xff0000 
+                }] 
+            }).catch(()=>{});
+        }
+        return res.status(429).sendFile(path.join(__dirname, 'public', 'banned-permanent.html'));
+    }
+    next();
+}
+
+app.use(ddosProtection);
+
 
 async function isVpnProxy(ip) {
   try {
@@ -539,24 +560,23 @@ app.get('/banned-permanent.html', (req, res) => {
     res.status(404).send('banned-permanent.html hiányzik'); 
 });
 
-// GLOBAL BAN MIDDLEWARE
-app.use((req, res, next) => {
+// GLOBAL BAN MIDDLEWARE (Most már aszinkron a Redis miatt!)
+app.use(async (req, res, next) => {
   const ip = getClientIp(req);  
   if (!MY_IPS.includes(ip) && !WHITELISTED_IPS.includes(ip)) {
-    const bannedData = readBannedIPs();  
     
-    if (isIpBanned(ip)) {
+    if (await isIpBanned(ip)) {
         return res.status(403).sendFile(path.join(__dirname, 'public', 'banned-ip.html'));
     }
     
-    if (permanentBannedIPs.includes(ip) || bannedData.ips.includes(ip)) {
+    if (await isPermanentBanned(ip)) {
         return res.status(403).sendFile(path.join(__dirname, 'public', 'banned-permanent.html'));
     }
   }
   next();  
 });
 
-// HTML NAPLÓZÓ MIDDLEWARE
+// HTML NAPLÓZÓ MIDDLEWARE (Aszinkronizálva)
 app.use(async (req, res, next) => {
   const publicDir = path.join(__dirname, 'public');
   const fullUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
@@ -576,8 +596,7 @@ app.use(async (req, res, next) => {
 
   const ip = getClientIp(req);
   if (!MY_IPS.includes(ip) && !WHITELISTED_IPS.includes(ip)) {
-    const bannedData = readBannedIPs(); 
-    if (permanentBannedIPs.includes(ip) || bannedData.ips.includes(ip)) {
+    if (await isPermanentBanned(ip)) {
         return res.status(403).sendFile(path.join(__dirname, 'public', 'banned-permanent.html'));
     }
   }
@@ -732,34 +751,28 @@ app.get('/admin', (req, res) => {
 </html>`);
 });
 
-app.post('/admin/ban/form', express.urlencoded({ extended: true }), (req, res) => { 
+// Admin végpontok Aszinkronizálva a Redis miatt!
+app.post('/admin/ban/form', express.urlencoded({ extended: true }), async (req, res) => { 
     if (req.body.password !== ADMIN_PASSWORD) return res.status(401).send('Hibás jelszó'); 
-    banIp(normalizeIp(req.body.ip)); 
+    await banIp(normalizeIp(req.body.ip)); 
     res.send('✅ IP tiltva 24 órára.'); 
 });
 
-app.post('/admin/unban/form', express.urlencoded({ extended: true }), (req, res) => { 
+app.post('/admin/unban/form', express.urlencoded({ extended: true }), async (req, res) => { 
     if (req.body.password !== ADMIN_PASSWORD) return res.status(401).send('Hibás jelszó'); 
-    unbanIp(normalizeIp(req.body.ip)); 
+    await unbanIp(normalizeIp(req.body.ip)); 
     res.send('✅ IP feloldva.'); 
 });
 
-app.post('/admin/permanent-ban/form', express.urlencoded({ extended: true }), (req, res) => { 
+app.post('/admin/permanent-ban/form', express.urlencoded({ extended: true }), async (req, res) => { 
     if (req.body.password !== ADMIN_PASSWORD) return res.status(401).send('Hibás jelszó'); 
-    const ip = normalizeIp(req.body.ip); 
-    const d = readBannedIPs(); 
-    if(!d.ips.includes(ip)){ d.ips.push(ip); writeBannedIPs(d); } 
-    permanentBannedIPs.push(ip); 
+    await banPermanentIp(normalizeIp(req.body.ip)); 
     res.send('✅ IP véglegesen tiltva.'); 
 });
 
-app.post('/admin/permanent-unban/form', express.urlencoded({ extended: true }), (req, res) => { 
+app.post('/admin/permanent-unban/form', express.urlencoded({ extended: true }), async (req, res) => { 
     if (req.body.password !== ADMIN_PASSWORD) return res.status(401).send('Hibás jelszó'); 
-    const ip = normalizeIp(req.body.ip); 
-    const d = readBannedIPs(); 
-    const i = d.ips.indexOf(ip); 
-    if(i > -1){ d.ips.splice(i,1); writeBannedIPs(d); } 
-    permanentBannedIPs = permanentBannedIPs.filter(x => x !== ip); 
+    await unbanPermanentIp(normalizeIp(req.body.ip)); 
     res.send('✅ IP véglegesen feloldva.'); 
 });
 
@@ -789,7 +802,7 @@ app.post('/api/biztonsagi-naplo-v1', express.json(), async (req, res) => {
 
   // 2. Külső támadás ellenőrzése
   if (!originHelyes || !refererHelyes) {
-      banIp(ip); 
+      await banIp(ip); 
       
       axios.post(REPORT_WEBHOOK || ALERT_WEBHOOK, { 
           username: "API Védelmi Rendszer", 
@@ -850,19 +863,11 @@ app.post('/api/biztonsagi-naplo-v1', express.json(), async (req, res) => {
       'Jobb kattintás blokkolva (kontextus menü)'
   ];
 
-  const geoData = await getGeo(ip); 
-
   // Ha az üzenet nincs a listában -> Manipuláció gyanúja
   if (!validReasons.includes(reason)) {
       if (!MY_IPS.includes(ip) && !WHITELISTED_IPS.includes(ip)) {
            // Végleges tiltás aktiválása
-           if (!permanentBannedIPs.includes(ip)) permanentBannedIPs.push(ip);
-           
-           const bd = readBannedIPs(); 
-           if (!bd.ips.includes(ip)) { 
-               bd.ips.push(ip); 
-               writeBannedIPs(bd); 
-           }
+           await banPermanentIp(ip);
            
            axios.post(REPORT_WEBHOOK, { 
                username: "Spam / Manipuláció Észlelő", 
@@ -878,7 +883,7 @@ app.post('/api/biztonsagi-naplo-v1', express.json(), async (req, res) => {
 
   if (MY_IPS.includes(ip)) return res.json({ ok: true });
   
-  const count = recordBadAttempt(ip);
+  const count = await recordBadAttempt(ip);
   
   // Riasztás küldése
   axios.post(ALERT_WEBHOOK, { 
@@ -892,7 +897,7 @@ app.post('/api/biztonsagi-naplo-v1', express.json(), async (req, res) => {
   
   // Ha túl sokszor próbálkozott, tiltjuk
   if (count >= MAX_BAD_ATTEMPTS && !WHITELISTED_IPS.includes(ip)) {
-      banIp(ip);
+      await banIp(ip);
   }
   
   res.json({ ok: true });
@@ -926,5 +931,10 @@ app.get('/', (req, res) => {
 // 404 Kezelés
 app.use((req, res) => res.status(404).send('404 Not Found'));
 
-// SZERVER INDÍTÁSA
-app.listen(PORT, () => console.log(`Szerver elindult: http://localhost:${PORT}`));
+// ==========================================
+// SZERVER INDÍTÁSA - VERCEL EXPORT
+// A Vercel architektúra miatt az app.listen() nem kell
+// ==========================================
+// app.listen(PORT, () => console.log(`Szerver elindult: http://localhost:${PORT}`));
+
+module.exports = app;
