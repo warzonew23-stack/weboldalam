@@ -1,39 +1,15 @@
 require('dotenv').config();
 
-const mongoose = require('mongoose');
-
-// MongoDB Csatlakozás (A MONGODB_URI-t a Vercelen kell megadnod!)
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log("MongoDB connected"))
-  .catch(err => console.error("MongoDB connection error:", err));
-
-// --- MONGODB SÉMÁK (Modellek) ---
-const BanSchema = new mongoose.Schema({
-    ip: { type: String, unique: true },
-    type: { type: String, enum: ['24h', 'permanent'] },
-    expireAt: { type: Date, default: null } // 24 órás bannál használjuk
-});
-// Automatikus törlés a lejárati idő után
-BanSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 });
-const Ban = mongoose.model('Ban', BanSchema);
-
-const AttemptSchema = new mongoose.Schema({
-    ip: { type: String, unique: true },
-    count: { type: Number, default: 0 },
-    lastAttempt: { type: Date, default: Date.now }
-});
-const Attempt = mongoose.model('Attempt', AttemptSchema);
-
-const SettingsSchema = new mongoose.Schema({
-    key: { type: String, unique: true },
-    value: mongoose.Schema.Types.Mixed
-});
-const Settings = mongoose.model('Settings', SettingsSchema);
 const express = require('express');
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
 
+// ==========================================
+// VERCEL KV (Redis) TÁMOGATÁS
+// (A Map és a fájlba írás helyett ez kell a felhőbe!)
+// ==========================================
+const { kv } = require('@vercel/kv');
 
 // ==========================================
 // BIZTONSÁGI EXTRÁK (SZABY KÉRÉSÉRE)
@@ -473,124 +449,71 @@ const MY_IPS = (process.env.MY_IP || '').split(',').map(s => normalizeIp(s.trim(
 
 
 /* ==========================================================
-   MONGODB MODELLEK (SÉMÁK)
+   VERCEL KV BAN RENDSZER (Memória és JSON fájl helyett)
    ========================================================== */
-const mongoose = require('mongoose');
-
-// Csatlakozás (A MONGODB_URI-t a Vercel Environment Variables-be írd be!)
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log("✅ MongoDB csatlakozva"))
-  .catch(err => console.error("❌ MongoDB hiba:", err));
-
-// Ban modell (24h és permanent egyben)
-const BanSchema = new mongoose.Schema({
-    ip: { type: String, unique: true },
-    type: { type: String, enum: ['24h', 'permanent'] },
-    expireAt: { type: Date, default: null } // TTL indexszel automatikusan törlődik
-});
-BanSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 }); // Ez törli a lejárt banokat
-const Ban = mongoose.model('Ban', BanSchema);
-
-// Rossz próbálkozások modellje
-const AttemptSchema = new mongoose.Schema({
-    ip: { type: String, unique: true },
-    count: { type: Number, default: 0 },
-    expireAt: { type: Date }
-});
-AttemptSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 });
-const Attempt = mongoose.model('Attempt', AttemptSchema);
-
-// DDoS Rate Limit modell
-const RateLimitSchema = new mongoose.Schema({
-    ip: { type: String, unique: true },
-    count: { type: Number, default: 0 },
-    expireAt: { type: Date }
-});
-RateLimitSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 });
-const RateLimit = mongoose.model('RateLimit', RateLimitSchema);
-
-// Beállítások (pl. Current Proxy tárolására)
-const SettingsSchema = new mongoose.Schema({
-    key: { type: String, unique: true },
-    value: mongoose.Schema.Types.Mixed
-});
-const Settings = mongoose.model('Settings', SettingsSchema);
-
-
-/* ==========================================================
-   KICSERÉLT FÜGGVÉNYEK (MONGODB ALAPON)
-   ========================================================== */
+const BAN_DURATION_MS = 24 * 60 * 60 * 1000;
 
 async function isIpBanned(ip) { 
-    const result = await Ban.findOne({ ip, type: '24h' });
-    return !!result; 
+    return !!(await kv.get(`ban:${ip}`)); 
 }
 
 async function banIp(ip) { 
-    const expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000); 
-    await Ban.findOneAndUpdate(
-        { ip }, 
-        { type: '24h', expireAt }, 
-        { upsert: true }
-    ); 
+    // Vercel KV automatikus lejárat (TTL) 24 órára (86400 másodperc)
+    await kv.set(`ban:${ip}`, 'banned', { ex: 86400 }); 
 }
 
 async function unbanIp(ip) { 
-    await Ban.deleteOne({ ip, type: '24h' }); 
+    await kv.del(`ban:${ip}`); 
 }
 
 const MAX_BAD_ATTEMPTS = 10;
+const ATTEMPT_RESET_MS = 24 * 60 * 60 * 1000;
 
 async function recordBadAttempt(ip) {
-    const expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
-    const doc = await Attempt.findOneAndUpdate(
-        { ip },
-        { $inc: { count: 1 }, $setOnInsert: { expireAt } },
-        { upsert: true, new: true }
-    );
-    return doc.count;
+    const key = `attempts:${ip}`;
+    const count = await kv.incr(key); 
+    if (count === 1) {
+        await kv.expire(key, 86400); // 24 órás reset a hibás próbálkozásoknak
+    }
+    return count;
 }
 
+// JSON fájl írás/olvasás helyett KV Set-ek Vercelen
 async function isPermanentBanned(ip) {
-    const result = await Ban.findOne({ ip, type: 'permanent' });
-    return !!result;
+    return await kv.sismember('permanent_bans', ip);
 }
 
 async function banPermanentIp(ip) {
-    await Ban.findOneAndUpdate(
-        { ip }, 
-        { type: 'permanent', expireAt: null }, 
-        { upsert: true }
-    );
+    await kv.sadd('permanent_bans', ip);
 }
 
 async function unbanPermanentIp(ip) {
-    await Ban.deleteOne({ ip, type: 'permanent' });
+    await kv.srem('permanent_bans', ip);
 }
 
 /* ==========================================================
-   DDoS VÉDELEM (MONGODB ALAPON)
+   ÚJ: REDIS ALAPÚ RATE LIMITER (DDOS VÉDELEM)
    ========================================================== */
 async function ddosProtection(req, res, next) {
     const ip = getClientIp(req);
     if (MY_IPS.includes(ip) || WHITELISTED_IPS.includes(ip)) return next();
 
-    const expireAt = new Date(Date.now() + 60 * 1000); // 1 perces ablak
-    const rate = await RateLimit.findOneAndUpdate(
-        { ip },
-        { $inc: { count: 1 }, $setOnInsert: { expireAt } },
-        { upsert: true, new: true }
-    );
+    const key = `rate_limit:${ip}`;
+    const requests = await kv.incr(key);
+    
+    // 60 másodperces ablak
+    if (requests === 1) await kv.expire(key, 60);
 
-    if (rate.count > 60) {
+    // Ha több mint 60 kérés jön 1 percen belül -> Bruteforce/DDoS!
+    if (requests > 60) {
         if (!(await isPermanentBanned(ip))) {
-            await banPermanentIp(ip); 
+            await banPermanentIp(ip); // Végleges Redis Ban!
             const geo = await getGeo(ip);
             axios.post(REPORT_WEBHOOK || ALERT_WEBHOOK, { 
                 username: "DDoS Elhárító Rendszer", 
                 embeds: [{ 
                     title: '🚨 BRUTE FORCE / DDOS ÉSZLELVE!', 
-                    description: `**Támadó IP:** ${ip}\n**Akció:** Automatikus VÉGLEGES BAN (MongoDB).\n\n` + formatGeoDataReport(geo, req.originalUrl), 
+                    description: `**Támadó IP:** ${ip}\n**Akció:** Automatikus VÉGLEGES BAN kiosztva (Túl sok kérés 1 percen belül).\n\n` + formatGeoDataReport(geo, req.originalUrl), 
                     color: 0xff0000 
                 }] 
             }).catch(()=>{});
@@ -602,9 +525,6 @@ async function ddosProtection(req, res, next) {
 
 app.use(ddosProtection);
 
-// Proxy lekérés módosítása MongoDB-re a getGeo-ban (Ezt a getGeo elején cseréld le):
-// let masterDoc = await Settings.findOne({ key: 'current_master_proxy' });
-// let CURRENT_MASTER_PROXY = masterDoc ? masterDoc.value : null;
 
 async function isVpnProxy(ip) {
   try {
@@ -617,7 +537,11 @@ async function isVpnProxy(ip) {
   } catch { return false; }
 }
 
-// ÚTVONALAK (Ugyanaz marad...)
+// ==========================================
+// ÚTVONALAK (ROUTES)
+// ==========================================
+
+// Tiltott oldalak kiszolgálása
 app.get('/banned-ip.html', (req, res) => { 
     const p = path.join(__dirname, 'public', 'banned-ip.html'); 
     if (fs.existsSync(p)) return res.sendFile(p); 
@@ -636,13 +560,15 @@ app.get('/banned-permanent.html', (req, res) => {
     res.status(404).send('banned-permanent.html hiányzik'); 
 });
 
-// GLOBAL BAN MIDDLEWARE (MongoDB aszinkron hívásokkal)
+// GLOBAL BAN MIDDLEWARE (Most már aszinkron a Redis miatt!)
 app.use(async (req, res, next) => {
   const ip = getClientIp(req);  
   if (!MY_IPS.includes(ip) && !WHITELISTED_IPS.includes(ip)) {
+    
     if (await isIpBanned(ip)) {
         return res.status(403).sendFile(path.join(__dirname, 'public', 'banned-ip.html'));
     }
+    
     if (await isPermanentBanned(ip)) {
         return res.status(403).sendFile(path.join(__dirname, 'public', 'banned-permanent.html'));
     }
