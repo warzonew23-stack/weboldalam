@@ -34,11 +34,6 @@ const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
 
-// ==========================================
-// VERCEL KV (Redis) TÁMOGATÁS
-// (A Map és a fájlba írás helyett ez kell a felhőbe!)
-// ==========================================
-const { kv } = require('@vercel/kv');
 
 // ==========================================
 // BIZTONSÁGI EXTRÁK (SZABY KÉRÉSÉRE)
